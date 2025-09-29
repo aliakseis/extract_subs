@@ -280,10 +280,10 @@ static string sanitize_sub_text_fast(const string& in) {
     return trim(final_out);
 }
 
-// ASS plaintext extraction (keeps the basic semantics of removing override tags etc.)
-// We reuse ass_to_plaintext idea but simplified: we'll reuse the provided implementation idea.
-std::string ass_to_plaintext(const char* in) {
+std::string ass_to_plaintext(const char* in)
+{
     std::string result;
+
     bool in_tag = false;
     const char* open_tag_pos = nullptr;
     bool in_drawing = false;
@@ -295,9 +295,12 @@ std::string ass_to_plaintext(const char* in) {
             }
             else if (in[0] == '\\' && in[1] == 'p') {
                 in += 2;
+                // Skip text between \pN and \p0 tags. A \p without a number
+                // is the same as \p0, and leading 0s are also allowed.
                 in_drawing = false;
                 while (in[0] >= '0' && in[0] <= '9') {
-                    if (in[0] != '0') in_drawing = true;
+                    if (in[0] != '0')
+                        in_drawing = true;
                     in += 1;
                 }
             }
@@ -326,10 +329,56 @@ std::string ass_to_plaintext(const char* in) {
             }
         }
     }
+    // A '{' without a closing '}' is always visible.
     if (in_tag) {
         result += open_tag_pos;
     }
+
     return result;
+}
+
+std::string fromAss(const char* ass) {
+    auto b = ass_to_plaintext(ass);
+    int hour1, min1, sec1, hunsec1, hour2, min2, sec2, hunsec2;
+    char line[1024];
+    // fixme: "\0" maybe not allowed
+    if (sscanf(b.c_str(), "Dialogue: Marked=%*d,%d:%d:%d.%d,%d:%d:%d.%d%1023[^\r\n]", //&nothing,
+        &hour1, &min1, &sec1, &hunsec1,
+        &hour2, &min2, &sec2, &hunsec2,
+        line) < 9)
+        if (sscanf(b.c_str(), "Dialogue: %*d,%d:%d:%d.%d,%d:%d:%d.%d%1023[^\r\n]", //&nothing,
+            &hour1, &min1, &sec1, &hunsec1,
+            &hour2, &min2, &sec2, &hunsec2,
+            line) < 9)
+            if (sscanf(b.c_str(), "%d,%d%1023[^\r\n]",  //&nothing,
+                &sec1, &sec2, line) < 3)
+                return b;  // libass ASS_Event.Text has no Dialogue
+    auto ret = strchr(line, ',');
+    if (!ret)
+        return line;
+    static const char kDefaultStyle[] = "Default,";
+    for (int comma = 0; comma < 6; comma++) {
+        if (!(ret = strchr(++ret, ','))) {
+            // workaround for ffmpeg decoded srt in ass format: "Dialogue: 0,0:42:29.20,0:42:31.08,Default,Chinese\NEnglish.
+            if (!(ret = strstr(line, kDefaultStyle))) {
+                if (line[0] == ',') //work around for libav-9-
+                    return line + 1;
+                return line;
+            }
+            ret += sizeof(kDefaultStyle) - 1 - 1; // tail \0
+        }
+    }
+    ret++;
+    const auto p = strcspn(b.c_str(), "\r\n");
+    if (p == b.size()) //not found
+        return ret;
+
+    std::string line2 = b.substr(p + 1);
+    line2 = trim(line2);
+    if (line2.empty())
+        return ret;
+
+    return ret + ("\n" + line2);
 }
 
 struct Cue {
@@ -359,371 +408,94 @@ static string av_err_to_string(int errnum) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: extract_subs [ -o outfile.srt ] [ -sid stream_index ] [ -lang xx ] <video-file>\n";
-        return 1;
-    }
-
-    string infile;
-    string forced_out;
-    int forced_sid = -1;
-    string forced_lang;
-
-    // Simple arg parsing
-    for (int i = 1; i < argc; ++i) {
-        string a = argv[i];
-        if (a == "-o" && i + 1 < argc) { forced_out = argv[++i]; continue; }
-        if (a == "-sid" && i + 1 < argc) { forced_sid = std::atoi(argv[++i]); continue; }
-        if (a == "-lang" && i + 1 < argc) { forced_lang = argv[++i]; continue; }
-        if (a == "--") { if (i + 1 < argc) infile = argv[++i]; break; }
-        if (a.size() && a[0] == '-') {
-            std::cerr << "Unknown option: " << a << "\n";
-            return 1;
-        }
-        infile = a;
-    }
-    if (infile.empty()) { std::cerr << "No input file specified.\n"; return 1; }
+    if (argc < 2) { std::cerr << "Usage: extract_subs <video-file>\n"; return 1; }
+    string infile = argv[1];
 
     av_log_set_level(AV_LOG_ERROR);
-    avformat_network_init();
-
     AVFormatContext* fmt = nullptr;
-    int err = avformat_open_input(&fmt, infile.c_str(), nullptr, nullptr);
-    if (err < 0) {
-        std::cerr << "Error: cannot open file: " << infile << " -> " << av_err_to_string(err) << "\n";
-        return 2;
+    if (avformat_open_input(&fmt, infile.c_str(), nullptr, nullptr) < 0) {
+        std::cerr << "Error opening file\n"; return 2;
     }
-    // Ensure cleanup on exit
-    std::unique_ptr<AVFormatContext, void(*)(AVFormatContext*)> fmt_guard(fmt, [](AVFormatContext* p) { avformat_close_input(&p); });
-
-    if ((err = avformat_find_stream_info(fmt, nullptr)) < 0) {
-        std::cerr << "Error: cannot find stream info -> " << av_err_to_string(err) << "\n";
-        return 3;
+    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+        std::cerr << "Error: cannot find stream info\n"; avformat_close_input(&fmt); return 3;
     }
 
-    string syslang = forced_lang.empty() ? get_system_language() : forced_lang;
-    std::transform(syslang.begin(), syslang.end(), syslang.begin(), ::tolower);
+    string syslang = get_system_language();
     if (syslang.empty()) syslang = "en";
 
-    // Collect subtitle streams
-    vector<int> sub_streams;
+    vector<int> candidates;
     for (unsigned i = 0; i < fmt->nb_streams; ++i) {
-        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
-            sub_streams.push_back((int)i);
-    }
-
-    if (sub_streams.empty()) {
-        std::cerr << "No subtitle streams in file.\n";
-        return 4;
-    }
-
-    vector<int> candidate_streams;
-    if (forced_sid >= 0) {
-        // validate
-        if (forced_sid < 0 || (size_t)forced_sid >= fmt->nb_streams) {
-            std::cerr << "Invalid -sid " << forced_sid << "\n";
-            return 1;
-        }
-        if (fmt->streams[forced_sid]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
-            std::cerr << "-sid refers to non-subtitle stream\n";
-            return 1;
-        }
-        candidate_streams.push_back(forced_sid);
-    }
-    else {
-        // find streams matching language
-        for (int si : sub_streams) {
-            AVDictionaryEntry* tag = av_dict_get(fmt->streams[si]->metadata, "language", nullptr, 0);
-            string lang = tag ? string(tag->value) : "";
-            std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
-            if (!lang.empty()) {
-                if (lang == syslang || lang.find(syslang) == 0) {
-                    candidate_streams.push_back(si);
-                    continue;
-                }
-                if (lang.size() >= 2 && syslang.size() >= 2 && lang.substr(0, 2) == syslang.substr(0, 2)) {
-                    candidate_streams.push_back(si);
-                    continue;
-                }
-            }
-            else {
-                // keep no-language as fallback
-            }
-        }
-        // If none matched explicitly, pick all subtitle streams as fallback
-        if (candidate_streams.empty()) {
-            for (int si : sub_streams) candidate_streams.push_back(si);
-        }
-    }
-
-    if (candidate_streams.empty()) {
-        std::cerr << "No candidate subtitle streams found.\n";
-        return 5;
-    }
-
-    vector<Cue> cues;
-
-    // Prepare packet and loop reading entire file once, but decode selected streams.
-    // We'll read frames and dispatch packets by stream index.
-    AVPacket* pkt = av_packet_alloc();
-    if (!pkt) { std::cerr << "av_packet_alloc failed\n"; return 1; }
-    std::unique_ptr<AVPacket, void(*)(AVPacket*)> pkt_guard(pkt, [](AVPacket* p) { av_packet_free(&p); });
-
-    // For each candidate stream prepare decoder contexts and track them
-    struct StreamDecoder {
-        int stream_index;
-        AVCodecContext* cctx;
-    };
-    vector<StreamDecoder> decs;
-    for (int si : candidate_streams) {
-        AVStream* st = fmt->streams[si];
-        const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
-        if (!dec) {
-            std::cerr << "Warning: no decoder for stream " << si << "\n";
-            continue;
-        }
-        AVCodecContext* cctx = avcodec_alloc_context3(dec);
-        if (!cctx) { std::cerr << "Warning: cannot alloc codec context for stream " << si << "\n"; continue; }
-        if ((err = avcodec_parameters_to_context(cctx, st->codecpar)) < 0) {
-            std::cerr << "Warning: cannot copy codec params for stream " << si << " -> " << av_err_to_string(err) << "\n";
-            avcodec_free_context(&cctx);
-            continue;
-        }
-        if ((err = avcodec_open2(cctx, dec, nullptr)) < 0) {
-            std::cerr << "Warning: cannot open decoder for stream " << si << " -> " << av_err_to_string(err) << "\n";
-            avcodec_free_context(&cctx);
-            continue;
-        }
-        decs.push_back({ si, cctx });
-    }
-
-    if (decs.empty()) {
-        std::cerr << "No usable subtitle decoders available.\n";
-        return 6;
-    }
-
-    // We'll read whole file and feed packets to decoders for only those streams.
-    // Note: av_read_frame reads sequentially; we feed packets to appropriate decoder(s).
-    while ((err = av_read_frame(fmt, pkt)) >= 0) {
-        for (auto& sd : decs) {
-            if (pkt->stream_index != sd.stream_index) continue;
-            // send packet
-            int s = avcodec_send_packet(sd.cctx, pkt);
-            if (s < 0) {
-                // In subtitle decoding, some packets may not be decodeable; report but continue
-                // do not treat as fatal
-                //std::cerr << "Warning: avcodec_send_packet failed for stream " << sd.stream_index << ": " << av_err_to_string(s) << "\n";
-                continue;
-            }
-            // receive all subtitles produced by this packet
-            while (true) {
-                AVSubtitle sub;
-                avsubtitle_free(&sub); // ensure clean
-                memset(&sub, 0, sizeof(sub));
-                int recv = avcodec_receive_subtitle(sd.cctx, &sub);
-                if (recv == AVERROR(EAGAIN) || recv == AVERROR_EOF) {
-                    break;
-                }
-                if (recv < 0) {
-                    // decode error: skip
-                    //std::cerr << "Warning: avcodec_receive_subtitle error: " << av_err_to_string(recv) << "\n";
-                    break;
-                }
-                // Build accumulated text for this subtitle (concatenate rects)
-                string accumulated;
-                for (unsigned r = 0; r < sub.num_rects; ++r) {
-                    AVSubtitleRect* rect = sub.rects[r];
-                    if (!rect) continue;
-                    string text;
-                    if (rect->ass && strlen(rect->ass) > 0) {
-                        text = ass_to_plaintext(rect->ass);
-                    }
-                    else if (rect->text && strlen(rect->text) > 0) {
-                        text = rect->text;
-                    }
-                    else if (rect->sub_text && strlen(rect->sub_text) > 0) {
-                        // older field name
-                        text = rect->sub_text;
-                    }
-                    else {
-                        continue;
-                    }
-                    if (!accumulated.empty()) accumulated += "\n";
-                    accumulated += text;
-                }
-
-                // Convert pts/display time to ms
-                int64_t start_ms = AV_NOPTS_VALUE;
-                int64_t end_ms = AV_NOPTS_VALUE;
-                AVStream* st = fmt->streams[sd.stream_index];
-                if (sub.pts != AV_NOPTS_VALUE) {
-                    AVRational tb = st->time_base;
-                    if (tb.num && tb.den) start_ms = av_rescale_q(sub.pts, tb, AVRational{ 1,1000 });
-                    else start_ms = av_rescale_q(sub.pts, AVRational{ 1,AV_TIME_BASE }, AVRational{ 1,1000 });
-                }
-                else if (pkt->pts != AV_NOPTS_VALUE) {
-                    AVRational tb = st->time_base;
-                    start_ms = (tb.num && tb.den) ? av_rescale_q(pkt->pts, tb, AVRational{ 1,1000 }) : 0;
-                }
-                else {
-                    start_ms = 0;
-                }
-                if (sub.end_display_time > 0) {
-                    if (start_ms != AV_NOPTS_VALUE) end_ms = start_ms + sub.end_display_time;
-                    else end_ms = sub.end_display_time;
-                }
-                else {
-                    // try to use pkt duration
-                    if (pkt->duration > 0 && pkt->pts != AV_NOPTS_VALUE) {
-                        AVRational tb = st->time_base;
-                        int64_t pkt_ms = (tb.num && tb.den) ? av_rescale_q(pkt->pts, tb, AVRational{ 1,1000 }) : 0;
-                        int64_t dur_ms = (tb.num && tb.den) ? av_rescale_q(pkt->duration, tb, AVRational{ 1,1000 }) : 2000;
-                        start_ms = pkt_ms;
-                        end_ms = pkt_ms + dur_ms;
-                    }
-                    else {
-                        if (start_ms == AV_NOPTS_VALUE) start_ms = 0;
-                        end_ms = start_ms + 2000;
-                    }
-                }
-                if (start_ms == AV_NOPTS_VALUE) start_ms = 0;
-                if (end_ms == AV_NOPTS_VALUE || end_ms < start_ms) end_ms = start_ms + 2000;
-
-                string clean = sanitize_sub_text_fast(accumulated);
-                if (!clean.empty()) {
-                    Cue c; c.start_ms = start_ms; c.end_ms = end_ms; c.text = clean;
-                    cues.push_back(std::move(c));
-                }
-
-                avsubtitle_free(&sub);
-            } // receive loop
-        } // for decs
-        av_packet_unref(pkt);
-    }
-
-    // flush decoders (send null packet)
-    for (auto& sd : decs) {
-        avcodec_send_packet(sd.cctx, nullptr);
-        while (true) {
-            AVSubtitle sub;
-            memset(&sub, 0, sizeof(sub));
-            int recv = avcodec_receive_subtitle(sd.cctx, &sub);
-            if (recv == AVERROR(EAGAIN) || recv == AVERROR_EOF) break;
-            if (recv < 0) break;
-            string accumulated;
-            for (unsigned r = 0; r < sub.num_rects; ++r) {
-                AVSubtitleRect* rect = sub.rects[r];
-                if (!rect) continue;
-                string text;
-                if (rect->ass && strlen(rect->ass) > 0) {
-                    text = ass_to_plaintext(rect->ass);
-                }
-                else if (rect->text && strlen(rect->text) > 0) {
-                    text = rect->text;
-                }
-                else if (rect->sub_text && strlen(rect->sub_text) > 0) {
-                    text = rect->sub_text;
-                }
-                else {
-                    continue;
-                }
-                if (!accumulated.empty()) accumulated += "\n";
-                accumulated += text;
-            }
-            int64_t start_ms = AV_NOPTS_VALUE, end_ms = AV_NOPTS_VALUE;
-            if (sub.pts != AV_NOPTS_VALUE) {
-                AVRational tb = fmt->streams[sd.stream_index]->time_base;
-                start_ms = (tb.num && tb.den) ? av_rescale_q(sub.pts, tb, AVRational{ 1,1000 }) : 0;
-            }
-            else start_ms = 0;
-            if (sub.end_display_time > 0) {
-                end_ms = start_ms + sub.end_display_time;
-            }
-            else end_ms = start_ms + 2000;
-            if (start_ms == AV_NOPTS_VALUE) start_ms = 0;
-            if (end_ms == AV_NOPTS_VALUE || end_ms < start_ms) end_ms = start_ms + 2000;
-            string clean = sanitize_sub_text_fast(accumulated);
-            if (!clean.empty()) cues.push_back({ start_ms, end_ms, clean });
-            avsubtitle_free(&sub);
-        }
-    }
-
-    // free codec contexts
-    for (auto& sd : decs) {
-        avcodec_free_context(&sd.cctx);
-    }
-
-    if (cues.empty()) {
-        std::cerr << "No cues extracted.\n";
-        return 7;
-    }
-
-    // Sort cues by start time
-    std::sort(cues.begin(), cues.end(), [](const Cue& a, const Cue& b) {
-        if (a.start_ms != b.start_ms) return a.start_ms < b.start_ms;
-        if (a.end_ms != b.end_ms) return a.end_ms < b.end_ms;
-        return a.text < b.text;
-        });
-
-    // Collapse duplicate consecutive lines inside each cue and trim
-    for (auto& m : cues) {
-        std::istringstream iss(m.text);
-        string out, line, prev;
-        bool first = true;
-        while (std::getline(iss, line)) {
-            if (line == prev) continue;
-            if (!first) out += "\n";
-            out += line;
-            prev = line;
-            first = false;
-        }
-        m.text = trim(out);
-    }
-
-    // Merge very-close/overlapping cues (simple merge: join text if overlapping or within 250ms)
-    vector<Cue> merged;
-    for (auto& c : cues) {
-        if (merged.empty()) { merged.push_back(c); continue; }
-        Cue& last = merged.back();
-        if (c.start_ms <= last.end_ms + 250) {
-            // merge
-            if (c.text == last.text) {
-                last.end_ms = std::max(last.end_ms, c.end_ms);
-            }
-            else {
-                last.text = last.text + "\n" + c.text;
-                last.end_ms = std::max(last.end_ms, c.end_ms);
-            }
+        AVStream* st = fmt->streams[i];
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
+        AVDictionaryEntry* tag = av_dict_get(st->metadata, "language", nullptr, 0);
+        string lang = tag ? tag->value : "";
+        std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
+        if (!lang.empty()) {
+            if (lang == syslang || lang.find(syslang) == 0) candidates.push_back(i);
+            else if (lang.size() >= 2 && syslang.size() >= 2 && lang.substr(0, 2) == syslang.substr(0, 2))
+                candidates.push_back(i);
         }
         else {
-            merged.push_back(c);
+            candidates.push_back(i);
         }
     }
+    if (candidates.empty()) { std::cerr << "No subtitle streams found\n"; avformat_close_input(&fmt); return 4; }
 
-    // Build output filename if not forced
-    string outfile;
-    if (!forced_out.empty()) outfile = forced_out;
-    else {
-        size_t dot = infile.find_last_of('.');
-        if (dot == string::npos) outfile = infile + ".srt";
-        else outfile = infile.substr(0, dot) + ".srt";
+    vector<Cue> cues;
+    for (int si : candidates) {
+        AVStream* st = fmt->streams[si];
+        const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
+        if (!dec) continue;
+        AVCodecContext* cctx = avcodec_alloc_context3(dec);
+        avcodec_parameters_to_context(cctx, st->codecpar);
+        avcodec_open2(cctx, dec, nullptr);
+
+        AVPacket pkt{}; // FIX: zero-init instead of av_init_packet
+        while (av_read_frame(fmt, &pkt) >= 0) {
+            if (pkt.stream_index != si) { av_packet_unref(&pkt); continue; }
+            AVSubtitle sub; int got_sub = 0;
+            int ret = avcodec_decode_subtitle2(cctx, &sub, &got_sub, &pkt);
+            if (ret >= 0 && got_sub) {
+                string text;
+                for (unsigned r = 0; r < sub.num_rects; ++r) {
+                    auto rect = sub.rects[r];
+                    if (!rect) continue;
+                    if (rect->ass && strlen(rect->ass))
+                        text += fromAss(rect->ass);
+                    else if (rect->text && strlen(rect->text))
+                        text += rect->text;
+                }
+                text = sanitize_sub_text_fast(text);
+                if (!text.empty()) {
+                    int64_t start_ms = (sub.pts == AV_NOPTS_VALUE ? 0 : sub.pts / 1000);
+                    int64_t end_ms = start_ms + (sub.end_display_time ? sub.end_display_time : 2000);
+                    cues.push_back({ start_ms,end_ms,text });
+                }
+                avsubtitle_free(&sub);
+            }
+            av_packet_unref(&pkt);
+        }
+        avcodec_free_context(&cctx);
+        avformat_seek_file(fmt, -1, INT64_MIN, 0, INT64_MAX, 0);
     }
+    avformat_close_input(&fmt);
 
-    std::ofstream ofs(outfile, std::ios::out | std::ios::trunc);
-    if (!ofs) {
-        std::cerr << "Cannot write output file: " << outfile << "\n";
-        return 8;
-    }
+    if (cues.empty()) { std::cerr << "No cues\n"; return 5; }
+    std::sort(cues.begin(), cues.end(), [](auto& a, auto& b) {return a.start_ms < b.start_ms; });
 
-    // Write SRT
+    // replace extension with .srt
+    string outfile = infile;
+    size_t dot = outfile.find_last_of('.');
+    if (dot != string::npos) outfile = outfile.substr(0, dot);
+    outfile += ".srt";
+
+    std::ofstream ofs(outfile);
     int idx = 1;
-    for (auto& m : merged) {
+    for (auto& m : cues) {
         ofs << idx++ << "\n";
         ofs << fmt_srt_time(m.start_ms) << " --> " << fmt_srt_time(m.end_ms) << "\n";
         ofs << m.text << "\n\n";
     }
-    ofs.close();
-
-    std::cout << "Extracted " << merged.size() << " cues to: " << outfile << "\n";
+    std::cout << "Extracted " << cues.size() << " cues to " << outfile << "\n";
     return 0;
 }
