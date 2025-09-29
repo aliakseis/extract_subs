@@ -12,6 +12,9 @@
 #include <sstream>
 #include <map>
 
+#include <cstdlib>
+#include <cstring>
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -25,20 +28,6 @@ using std::vector;
 
 #ifdef _WIN32
 #include <windows.h>
-#include <cstdlib>
-#include <cstring>
-
-// safe getenv wrapper for Windows to avoid MSVC deprecation warning for getenv
-static std::string getEnv(const char* name) {
-    char* buffer = nullptr;
-    size_t sz = 0;
-    if (_dupenv_s(&buffer, &sz, name) == 0 && buffer != nullptr) {
-        std::string val(buffer);
-        free(buffer); // _dupenv_s uses malloc
-        return val;
-    }
-    return std::string();
-}
 
 // normalize a locale-like string into a two-letter lowercase lang (e.g., "ru-RU" -> "ru")
 static std::string normalize_lang(const std::string& s) {
@@ -73,7 +62,7 @@ static std::string get_system_language() {
     }
 
     // 3) Fallback to LANG environment variable (safe)
-    std::string langEnv = getEnv("LANG");
+    std::string langEnv = std::getenv("LANG");
     if (!langEnv.empty()) return normalize_lang(langEnv);
 
     // 4) Fallback to C++ locale
@@ -90,12 +79,6 @@ static std::string get_system_language() {
 
 #else // POSIX / other
 
-#include <cstdlib>
-
-static std::string getEnv(const char* name) {
-    const char* v = std::getenv(name);
-    return v ? std::string(v) : std::string();
-}
 
 static std::string normalize_lang(const std::string& s) {
     if (s.empty()) return std::string();
@@ -110,7 +93,7 @@ static std::string normalize_lang(const std::string& s) {
 }
 
 static std::string get_system_language() {
-    std::string langEnv = getEnv("LANG");
+    std::string langEnv = std::getenv("LANG");
     if (!langEnv.empty()) return normalize_lang(langEnv);
     try {
         std::locale loc("");
