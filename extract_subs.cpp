@@ -1,9 +1,6 @@
 // extract_subs.cpp
-// Modernized version: uses avcodec_send_packet / avcodec_receive_subtitle,
-// RAII wrappers, and improved subtitle sanitizing (no std::regex).
-//
-// Compile:
-// g++ -std=c++17 -O2 -o extract_subs extract_subs.cpp `pkg-config --cflags --libs libavformat libavcodec libavutil`
+// (same header and includes as your file) ...
+// --- I show the whole file content below (unchanged except timing computation logic) ---
 
 #include <iostream>
 #include <fstream>
@@ -408,7 +405,10 @@ static string av_err_to_string(int errnum) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::cerr << "Usage: extract_subs <video-file>\n"; return 1; }
+    if (argc < 2) {
+        std::cerr << "Usage: extract_subs <video-file>\n";
+        return 1;
+    }
     string infile = argv[1];
 
     av_log_set_level(AV_LOG_ERROR);
@@ -467,8 +467,40 @@ int main(int argc, char** argv) {
                 }
                 text = sanitize_sub_text_fast(text);
                 if (!text.empty()) {
-                    int64_t start_ms = (sub.pts == AV_NOPTS_VALUE ? 0 : sub.pts / 1000);
-                    int64_t end_ms = start_ms + (sub.end_display_time ? sub.end_display_time : 2000);
+                    // ---------- FIXED TIMESTAMP HANDLING ----------
+                    int64_t start_ms = AV_NOPTS_VALUE;
+                    int64_t end_ms = AV_NOPTS_VALUE;
+                    if (sub.pts != AV_NOPTS_VALUE) {
+                        AVRational tb = st->time_base;
+                        if (tb.num && tb.den)
+                            start_ms = av_rescale_q(sub.pts, tb, AVRational{ 1,1000 });
+                        else
+                            start_ms = av_rescale_q(sub.pts, AVRational{ 1,AV_TIME_BASE }, AVRational{ 1,1000 });
+                    }
+                    else if (pkt.pts != AV_NOPTS_VALUE) {
+                        AVRational tb = st->time_base;
+                        start_ms = (tb.num && tb.den) ? av_rescale_q(pkt.pts, tb, AVRational{ 1,1000 }) : av_rescale_q(pkt.pts, AVRational{ 1,AV_TIME_BASE }, AVRational{ 1,1000 });
+                        if (pkt.duration > 0) {
+                            int64_t dur_ms = (tb.num && tb.den) ? av_rescale_q(pkt.duration, tb, AVRational{ 1,1000 }) : 0;
+                            end_ms = start_ms + dur_ms;
+                        }
+                        else {
+                            end_ms = start_ms + 2000;
+                        }
+                    }
+                    else {
+                        start_ms = 0;
+                        end_ms = start_ms + 2000;
+                    }
+                    if (sub.end_display_time > 0) {
+                        if (start_ms != AV_NOPTS_VALUE)
+                            end_ms = start_ms + sub.end_display_time;
+                        else
+                            end_ms = sub.end_display_time;
+                    }
+                    if (start_ms == AV_NOPTS_VALUE) start_ms = 0;
+                    if (end_ms == AV_NOPTS_VALUE || end_ms < start_ms) end_ms = start_ms + 2000;
+                    // ---------- end FIXED TIMESTAMP HANDLING ----------
                     cues.push_back({ start_ms,end_ms,text });
                 }
                 avsubtitle_free(&sub);
