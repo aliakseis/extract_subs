@@ -1,7 +1,3 @@
-// extract_subs.cpp
-// (same header and includes as your file) ...
-// --- I show the whole file content below (unchanged except timing computation logic) ---
-
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -522,6 +518,10 @@ int main(int argc, char** argv) {
     outfile += ".srt";
 
     std::ofstream ofs(outfile);
+
+    // UTF-8 BOM
+    ofs.write("\xEF\xBB\xBF", 3);
+
     int idx = 1;
     for (auto& m : cues) {
         ofs << idx++ << "\n";
