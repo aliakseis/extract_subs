@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <tuple>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -380,6 +382,12 @@ struct Cue {
     string text;
 };
 
+bool operator < (const Cue& left, const Cue& right)
+{
+    return std::tie(left.start_ms, left.end_ms, left.text) 
+        < std::tie(right.start_ms, right.end_ms, right.text);
+}
+
 static string fmt_srt_time(int64_t ms) {
     int64_t total_ms = ms;
     int64_t hours = total_ms / 3600000;
@@ -437,7 +445,7 @@ int main(int argc, char** argv) {
     }
     if (candidates.empty()) { std::cerr << "No subtitle streams found\n"; avformat_close_input(&fmt); return 4; }
 
-    vector<Cue> cues;
+    std::set<Cue> cues;
     for (int si : candidates) {
         AVStream* st = fmt->streams[si];
         const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
@@ -497,7 +505,7 @@ int main(int argc, char** argv) {
                     if (start_ms == AV_NOPTS_VALUE) start_ms = 0;
                     if (end_ms == AV_NOPTS_VALUE || end_ms < start_ms) end_ms = start_ms + 2000;
                     // ---------- end FIXED TIMESTAMP HANDLING ----------
-                    cues.push_back({ start_ms,end_ms,text });
+                    cues.insert({ start_ms,end_ms,text });
                 }
                 avsubtitle_free(&sub);
             }
@@ -508,8 +516,11 @@ int main(int argc, char** argv) {
     }
     avformat_close_input(&fmt);
 
-    if (cues.empty()) { std::cerr << "No cues\n"; return 5; }
-    std::sort(cues.begin(), cues.end(), [](auto& a, auto& b) {return a.start_ms < b.start_ms; });
+    if (cues.empty()) { 
+        std::cerr << "No cues\n";
+        return 5; 
+    }
+    //std::sort(cues.begin(), cues.end(), [](auto& a, auto& b) {return a.start_ms < b.start_ms; });
 
     // replace extension with .srt
     string outfile = infile;
